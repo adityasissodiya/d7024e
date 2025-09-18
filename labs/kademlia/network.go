@@ -105,6 +105,10 @@ func (network *Network) readLoop() {
 			network.handlePing(env, src)
 		case msgFindNode:
 			network.handleFindNode(env, src)
+		case msgStore:
+			network.handleStore(env, src)
+		case msgFindValue:
+			network.handleFindValue(env, src)
 		default:
 			// ignore unknown types
 		}
@@ -257,6 +261,144 @@ func (network *Network) SendFindContactMessageTo(peer *Contact, target *Contact)
 
 	case <-time.After(800 * time.Millisecond):
 		return nil, context.DeadlineExceeded
+	}
+}
+
+// ---------- M2 handlers ----------
+
+func (network *Network) handleStore(env envelope, src *net.UDPAddr) {
+	// learn sender
+	if c, err := env.From.toContact(); err == nil && network.kademlia != nil && network.kademlia.routingTable != nil {
+		network.kademlia.routingTable.AddContact(c)
+	}
+	// store locally
+	if env.KeyHex != "" && len(env.Value) > 0 && network.kademlia != nil {
+		network.kademlia.storeLocal(env.KeyHex, env.Value)
+	}
+	// ack
+	_ = network.send(src, envelope{
+		Type:  msgStoreOK,
+		From:  fromContact(network.kademlia.me),
+		MsgID: env.MsgID,
+	})
+}
+
+func (network *Network) handleFindValue(env envelope, src *net.UDPAddr) {
+	if network.kademlia == nil || network.kademlia.routingTable == nil {
+		return
+	}
+	// If we have the value locally, return it.
+	if val, ok := network.kademlia.loadLocal(env.KeyHex); ok {
+		_ = network.send(src, envelope{
+			Type:   msgFindValueOK,
+			From:   fromContact(network.kademlia.me),
+			MsgID:  env.MsgID,
+			KeyHex: env.KeyHex,
+			Value:  val,
+		})
+		return
+	}
+
+	// Otherwise return closest contacts to the key (treat key as ID)
+	if len(env.KeyHex) == 40 {
+		b, _ := hex.DecodeString(env.KeyHex)
+		var target KademliaID
+		copy(target[:], b)
+		contacts := network.kademlia.routingTable.FindClosestContacts(&target, bucketSize)
+		out := make([]wireContact, 0, len(contacts))
+		for _, c := range contacts {
+			out = append(out, fromContact(c))
+		}
+		_ = network.send(src, envelope{
+			Type:     msgFindValueOK,
+			From:     fromContact(network.kademlia.me),
+			MsgID:    env.MsgID,
+			KeyHex:   env.KeyHex,
+			Contacts: out,
+		})
+	}
+}
+
+// ---------- M2 client helpers (internal) ----------
+
+func (network *Network) sendStoreTo(peer *Contact, keyHex string, value []byte, timeout time.Duration) error {
+	if peer == nil || peer.Address == "" {
+		return fmt.Errorf("bad peer")
+	}
+	dst, err := net.ResolveUDPAddr("udp", peer.Address)
+	if err != nil {
+		return err
+	}
+	env := envelope{
+		Type:   msgStore,
+		From:   fromContact(network.kademlia.me),
+		MsgID:  network.nextMsgID(),
+		KeyHex: keyHex,
+		Value:  value,
+	}
+	ch := make(chan envelope, 1)
+	network.mu.Lock()
+	network.inflight[env.MsgID] = ch
+	network.mu.Unlock()
+	defer func() { network.mu.Lock(); delete(network.inflight, env.MsgID); network.mu.Unlock() }()
+
+	if err := network.send(dst, env); err != nil {
+		return err
+	}
+	select {
+	case <-ch:
+		return nil
+	case <-time.After(timeout):
+		return context.DeadlineExceeded
+	}
+}
+
+func (network *Network) sendFindValueTo(peer *Contact, keyHex string, timeout time.Duration) (val []byte, contacts []Contact, err error) {
+	if peer == nil || peer.Address == "" {
+		return nil, nil, fmt.Errorf("bad peer")
+	}
+	dst, err := net.ResolveUDPAddr("udp", peer.Address)
+	if err != nil {
+		return nil, nil, err
+	}
+	env := envelope{
+		Type:   msgFindValue,
+		From:   fromContact(network.kademlia.me),
+		MsgID:  network.nextMsgID(),
+		KeyHex: keyHex,
+	}
+	ch := make(chan envelope, 1)
+	network.mu.Lock()
+	network.inflight[env.MsgID] = ch
+	network.mu.Unlock()
+	defer func() { network.mu.Lock(); delete(network.inflight, env.MsgID); network.mu.Unlock() }()
+
+	if err := network.send(dst, env); err != nil {
+		return nil, nil, err
+	}
+	select {
+	case resp := <-ch:
+		// Learn responder + contacts we got back
+		if c, err2 := resp.From.toContact(); err2 == nil && network.kademlia != nil && network.kademlia.routingTable != nil {
+			network.kademlia.routingTable.AddContact(c)
+		}
+		for _, wc := range resp.Contacts {
+			if c, err2 := wc.toContact(); err2 == nil && network.kademlia != nil && network.kademlia.routingTable != nil {
+				network.kademlia.routingTable.AddContact(c)
+			}
+		}
+		if len(resp.Value) > 0 {
+			return resp.Value, nil, nil
+		}
+		out := make([]Contact, 0, len(resp.Contacts))
+		for _, wc := range resp.Contacts {
+			if c, err2 := wc.toContact(); err2 == nil {
+				out = append(out, c)
+			}
+		}
+		return nil, out, nil
+	case <-time.After(timeout):
+		return nil, nil, context.DeadlineExceeded
 	}
 }
 

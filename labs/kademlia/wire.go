@@ -18,6 +18,15 @@ const (
 	msgFindNodeOK msgType = "FIND_NODE_OK"
 )
 
+// --- M2 additions (STORE / FIND_VALUE) ---
+
+const (
+	msgStore       msgType = "STORE"
+	msgStoreOK     msgType = "STORE_OK"
+	msgFindValue   msgType = "FIND_VALUE"
+	msgFindValueOK msgType = "FIND_VALUE_OK"
+)
+
 // Minimal serializable contact for the wire. We do NOT serialize the in-memory
 // distance field; this avoids changing your Contact struct.
 type wireContact struct {
@@ -52,6 +61,10 @@ type envelope struct {
 	MsgID    string        `json:"msg_id"`
 	TargetID string        `json:"target_id,omitempty"` // hex string
 	Contacts []wireContact `json:"contacts,omitempty"`  // for FIND_NODE_OK
+
+	// M2 fields:
+	KeyHex string `json:"key,omitempty"`   // 40-char hex (SHA-1)
+	Value  []byte `json:"value,omitempty"` // raw bytes (base64 on wire)
 }
 
 func (e envelope) marshal() ([]byte, error)  { return json.Marshal(e) }

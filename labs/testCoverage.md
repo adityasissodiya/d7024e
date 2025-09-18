@@ -62,3 +62,14 @@ go tool covdata textfmt -i=./covdata -o runtime.out
 go tool cover -func=runtime.out
 go tool cover -html=runtime.out -o runtime.html
 ```
+# M1+M2 tests
+go test . -count=1 -v
+
+# Only M2 tests
+go test . -count=1 -v -run '^TestM2_'
+
+# Coverage (single package)
+go test . -count=1 -covermode=atomic -coverpkg=./... -coverprofile coverage.out
+go tool cover -func .\coverage.out
+go tool cover -html .\coverage.out -o coverage.html
+start .\coverage.html
