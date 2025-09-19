@@ -1,0 +1,126 @@
+classDiagram
+class Contact {
+  <<struct>>
+  ID: *KademliaID
+  Address: string
+  distance: *KademliaID
+  CalcDistance(target *KademliaID)
+  Less(otherContact *Contact)
+  String()
+}
+class ContactCandidates {
+  <<struct>>
+  contacts: []Contact
+  Append(contacts []Contact)
+  GetContacts(count int)
+  Len()
+  Less(i, j int)
+  Sort()
+  Swap(i, j int)
+}
+class Kademlia {
+  <<struct>>
+  me: Contact
+  routingTable: *RoutingTable
+  network: *Network
+  alpha: int
+  timeoutRPC: time.Duration
+  storeMu: sync.RWMutex
+  valueStore: map[string][]byte
+  Close()
+  ClosestContacts(target *KademliaID, count int)
+  Get(keyHex string)
+  Join(bootstrap *Contact)
+  LookupContact(target *Contact)
+  LookupData(hash string)
+  Put(data []byte)
+  Store(data []byte)
+  keyFromData(data []byte)
+  loadLocal(keyHex string)
+  storeLocal(keyHex string, value []byte)
+}
+class Network {
+  <<struct>>
+  conn: *net.UDPConn
+  kademlia: *Kademlia
+  mu: sync.Mutex
+  inflight: map[string]chan envelope
+  readStopped: chan struct\{
+  Close()
+  SendFindContactMessage(contact *Contact)
+  SendFindContactMessageTo(peer *Contact, target *Contact)
+  SendFindDataMessage(hash string)
+  SendPingMessage(contact *Contact)
+  SendStoreMessage(data []byte)
+  handleFindNode(env envelope, src *net.UDPAddr)
+  handleFindValue(env envelope, src *net.UDPAddr)
+  handlePing(env envelope, src *net.UDPAddr)
+  handleStore(env envelope, src *net.UDPAddr)
+  nextMsgID()
+  readLoop()
+  send(to *net.UDPAddr, env envelope)
+  sendFindValueTo(peer *Contact, keyHex string, timeout time.Duration)
+  sendStoreTo(peer *Contact, keyHex string, value []byte, timeout time.Duration)
+}
+class RoutingTable {
+  <<struct>>
+  me: Contact
+  buckets: [IDLength * 8]*bucket
+  AddContact(contact Contact)
+  FindClosestContacts(target *KademliaID, count int)
+  getBucketIndex(id *KademliaID)
+}
+class bucket {
+  <<struct>>
+  list: *list.List
+  AddContact(contact Contact)
+  GetContactAndCalcDistance(target *KademliaID)
+  Len()
+}
+class envelope {
+  <<struct>>
+  Type: msgType
+  From: wireContact
+  MsgID: string
+  TargetID: string
+  Contacts: []wireContact
+  KeyHex: string
+  Value: []byte
+  marshal()
+  unmarshal(b []byte)
+}
+class mismatchErr {
+  <<struct>>
+  Error()
+}
+class pair {
+  <<struct>>
+  c: Contact
+  dst: *KademliaID
+}
+class res {
+  <<struct>>
+  value: []byte
+  contacts: []Contact
+  from: *Contact
+  err: error
+}
+class result {
+  <<struct>>
+}
+class wireContact {
+  <<struct>>
+  IDHex: string
+  Address: string
+  toContact()
+}
+ContactCandidates *-- Contact
+Kademlia *-- Contact
+Kademlia *-- Network
+Kademlia *-- RoutingTable
+Network *-- Kademlia
+RoutingTable *-- Contact
+RoutingTable *-- bucket
+envelope *-- wireContact
+pair *-- Contact
+res *-- Contact
