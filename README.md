@@ -205,8 +205,7 @@ exit
 
 ---
 
-## 7) Capabilities vs. limitations (right now)
-
+## 7) Capabilities
 **What you can do**
 
 * Start multiple nodes on localhost, join them, and form a Kademlia network.
@@ -214,14 +213,6 @@ exit
 * `get` by key from any node; see which peer served it.
 * Values automatically **replicate** to K closest nodes on `put`.
 * Values fetched via `get` are **cached locally**.
-
-**What you cannot do (yet)**
-
-* Upload a **file path** directly (CLI expects raw text after `put`).
-* Persist data across restarts (in-memory only).
-* List keys, delete values, or change replication factor from CLI.
-* Use non-localhost networking safely (we haven’t hardened NAT/firewall cases).
-* Set advanced parameters (α, K, timeouts) via CLI flags.
 
 ---
 
