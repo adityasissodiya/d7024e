@@ -6,6 +6,11 @@
 
 ---
 
+## Architecture Diagram
+
+![Kademlia Architecture](labs/docs/kademlia_architecture.svg)
+
+
 ## 1) Prerequisites
 
 * **Go** installed (1.21+ recommended).
