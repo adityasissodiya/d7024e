@@ -33,13 +33,13 @@ The CLI runner lives at:
 **Windows (PowerShell):**
 
 ```powershell
-cd C:\Users\<you>\Downloads\D7024E\d7024e
+cd \d7024e\labs\kademlia\cmd\cli
 
 # Terminal 1 – start a node that listens on 127.0.0.1:9001
-go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
+go run . -addr 127.0.0.1:9001
 
 # Terminal 2 – start another node and bootstrap to the first
-go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
+go run . -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
 ```
 
 **macOS/Linux (bash/zsh):**
@@ -168,12 +168,12 @@ exit
 * Node A:
 
   ```bash
-  go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
+  go run . -addr 127.0.0.1:9001
   ```
 * Node B:
 
   ```bash
-  go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
+  go run . -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
   ```
 * In **Node B** CLI:
 
@@ -207,6 +207,24 @@ exit
   Force a specific node ID (otherwise a random ID is used).
 
 > IDs are 160-bit (20 bytes), shown as 40-char hex.
+
+**Values only get placed on the “responsible” nodes at *put time***. If a node didn’t exist (or wasn’t known) then, it won’t magically have those values later. And your `get` walks toward the nodes **closest (by XOR) to the key**, not “whoever might have it.” So after you bring up B, some of A’s old keys won’t be discoverable from B unless you re-publish them.
+
+* **A put values before B existed.** At that moment A only knew itself, so replication placed the value **on A only** (origin always keeps a copy; it can’t send to peers it doesn’t know).
+* Later if **bootstrapped B to A** and tried `get` from B for A’s earlier keys.
+  The `get` does a Kademlia lookup toward the nodes **closest to the key** (by XOR distance). If A isn’t among those “K closest” from B’s point of view, B won’t even ask A, so you get `NOTFOUND`.
+
+Why one direction works but not the other:
+
+* Key from **B → A succeeds**: when we `put` on B (after bootstrap), B’s replication sends to the K closest—**A was in that set**, so A got a replica. Then `get` on A works (A even serves it locally, hence `from 127.0.0.1:9001`).
+* Key from **A → B fails** (for your “Aditya” key): when A stored it, B didn’t exist, so only A had it. After B joins, the lookup from B heads toward nodes closest to that key—**and for that specific key, B is closer than A**, so the search doesn’t hit A and returns `NOTFOUND`.
+
+### So, will B be able to fetch values A put **before** bootstrap?
+
+* **Not guaranteed.** It only works if A happens to be among the K closest to that key (so B’s lookup reaches A). Otherwise you’ll see `NOTFOUND`.
+* The lab code (sensibly) doesn’t do background **republish/refresh**, so old values don’t move to the now-responsible nodes after the network changes.
+
+That’s the whole story: **placement is decided at publish time; lookup is proximity-driven.** If we publish while alone, the data is marooned until we republish (or the implementation has periodic republish/refresh, which it doesn’t).
 
 ---
 
