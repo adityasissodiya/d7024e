@@ -53,6 +53,10 @@ func NewKademlia(me Contact, ip string, port int) (*Kademlia, error) {
 	// Start background republisher AFTER network is ready.
 	go kademlia.republisher()
 	kademlia.network = netw
+	// Wire LRU-eviction liveness probe: ping with the same timeout used elsewhere.
+	kademlia.routingTable.SetPingFunc(func(c Contact) bool {
+		return kademlia.network.PingWait(&c, kademlia.timeoutRPC)
+	})
 	return kademlia, nil
 }
 

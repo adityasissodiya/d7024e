@@ -1,13 +1,31 @@
-FROM alpine:latest
+# ---------- build stage ----------
+FROM golang:1.22-alpine AS build
+WORKDIR /src
 
-# Add the commands needed to put your compiled go binary in the container and
-# run it when the container starts.
-#
-# See https://docs.docker.com/engine/reference/builder/ for a reference of all
-# the commands you can use in this file.
-#
-# In order to use this file together with the docker-compose.yml file in the
-# same directory, you need to ensure the image you build gets the name
-# "kadlab", which you do by using the following command:
-#
-# $ docker build . -t kadlab
+# Build in GOPATH mode so "d7024e/kademlia" imports resolve
+ENV GO111MODULE=off
+
+# Bring in the whole repo (compose build context will be the repo root)
+COPY . .
+
+# Map the package to GOPATH so imports like "d7024e/kademlia" work
+# Our code lives at labs/kademlia, but the import path expects /go/src/d7024e/kademlia
+RUN mkdir -p /go/src/d7024e \
+ && cp -a labs/kademlia /go/src/d7024e/kademlia
+
+# Sanity check (optional but handy)
+RUN test -f labs/kademlia/cmd/cli/main.go || (echo "CLI not found; wrong build context?" && ls -R && exit 1)
+
+# Build the CLI runner
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/kcli ./labs/kademlia/cmd/cli
+
+# ---------- runtime stage ----------
+FROM alpine:3.20
+RUN apk add --no-cache bash ca-certificates bind-tools
+WORKDIR /app
+COPY --from=build /out/kcli /app/kcli
+COPY labs/docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && sed -i 's/\r$//' /app/entrypoint.sh
+
+EXPOSE 9000/udp
+ENTRYPOINT ["/app/entrypoint.sh"]

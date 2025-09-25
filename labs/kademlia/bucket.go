@@ -8,13 +8,19 @@ import (
 // contains a List
 type bucket struct {
 	list *list.List
+	// Replacement cache (optional): recently seen contacts that didn't fit.
+	// Promoted into the bucket if a slot opens later.
+	repl    []Contact
+	replCap int
 }
 
 // newBucket returns a new instance of a bucket
 func newBucket() *bucket {
-	bucket := &bucket{}
-	bucket.list = list.New()
-	return bucket
+	//bucket := &bucket{}
+	//bucket.list = list.New()
+	//return bucket
+	b := &bucket{list: list.New(), replCap: 32}
+	return b
 }
 
 // AddContact adds the Contact to the front of the bucket
@@ -55,4 +61,31 @@ func (bucket *bucket) GetContactAndCalcDistance(target *KademliaID) []Contact {
 // Len return the size of the bucket
 func (bucket *bucket) Len() int {
 	return bucket.list.Len()
+}
+
+// addReplacement appends to the replacement cache (bounded, no dups).
+func (bucket *bucket) addReplacement(c Contact) {
+	// de-dup
+	for i := range bucket.repl {
+		if bucket.repl[i].ID.Equals(c.ID) {
+			return
+		}
+	}
+	if len(bucket.repl) >= bucket.replCap {
+		// drop oldest replacement; keep the more recent
+		copy(bucket.repl, bucket.repl[1:])
+		bucket.repl = bucket.repl[:bucket.replCap-1]
+	}
+	bucket.repl = append(bucket.repl, c)
+}
+
+// popReplacement returns the most recent replacement if any.
+func (bucket *bucket) popReplacement() (Contact, bool) {
+	n := len(bucket.repl)
+	if n == 0 {
+		return Contact{}, false
+	}
+	c := bucket.repl[n-1]
+	bucket.repl = bucket.repl[:n-1]
+	return c, true
 }

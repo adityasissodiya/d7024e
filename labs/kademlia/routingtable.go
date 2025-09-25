@@ -12,6 +12,8 @@ type RoutingTable struct {
 	me      Contact
 	buckets [IDLength * 8]*bucket
 	mu      sync.RWMutex
+	// Called outside the lock to test liveness of an LRU contact when a bucket is full.
+	pingFunc func(Contact) bool
 }
 
 // NewRoutingTable returns a new instance of a RoutingTable
@@ -24,13 +26,86 @@ func NewRoutingTable(me Contact) *RoutingTable {
 	return routingTable
 }
 
+// SetPingFunc wires a liveness probe used by the eviction policy.
+func (routingTable *RoutingTable) SetPingFunc(pf func(Contact) bool) {
+	routingTable.mu.Lock()
+	routingTable.pingFunc = pf
+	routingTable.mu.Unlock()
+}
+
 // AddContact add a new contact to the correct Bucket
 func (routingTable *RoutingTable) AddContact(contact Contact) {
+	//routingTable.mu.Lock()
+	//defer routingTable.mu.Unlock()
+	//bucketIndex := routingTable.getBucketIndex(contact.ID)
+	//bucket := routingTable.buckets[bucketIndex]
+	//bucket.AddContact(contact)
+	if contact.ID == nil {
+		return
+	}
+	// Ignore self.
+	if routingTable.me.ID != nil && routingTable.me.ID.Equals(contact.ID) {
+		return
+	}
+
+	bucketIndex := routingTable.getBucketIndex(contact.ID)
+
+	// ---- Phase 1: decide under lock (find existing / space / LRU) ----
+	routingTable.mu.Lock()
+	b := routingTable.buckets[bucketIndex]
+	// If already present, move-to-front (most-recent) and return.
+	for e := b.list.Front(); e != nil; e = e.Next() {
+		if e.Value.(Contact).ID.Equals(contact.ID) {
+			b.list.MoveToFront(e)
+			routingTable.mu.Unlock()
+			return
+		}
+	}
+	// If space exists, just insert at front.
+	if b.list.Len() < bucketSize {
+		b.list.PushFront(contact)
+		routingTable.mu.Unlock()
+		return
+	}
+
+	// Full: capture *current* LRU (least-recent) and release lock to ping it.
+	lruElt := b.list.Back()
+	lru := lruElt.Value.(Contact)
+	routingTable.mu.Unlock()
+
+	// ---- Phase 2: liveness check OUTSIDE the lock ----
+	alive := false
+	if routingTable.pingFunc != nil {
+		alive = routingTable.pingFunc(lru)
+	}
+
+	// ---- Phase 3: re-acquire and mutate bucket based on liveness ----
 	routingTable.mu.Lock()
 	defer routingTable.mu.Unlock()
-	bucketIndex := routingTable.getBucketIndex(contact.ID)
-	bucket := routingTable.buckets[bucketIndex]
-	bucket.AddContact(contact)
+	b = routingTable.buckets[bucketIndex]
+
+	if !alive {
+		// Evict the LRU (if still there), add the new contact at front.
+		for e := b.list.Back(); e != nil; e = e.Prev() {
+			if e.Value.(Contact).ID.Equals(lru.ID) {
+				b.list.Remove(e)
+				break
+			}
+		}
+		b.list.PushFront(contact)
+		return
+	}
+
+	// LRU responded: keep it (and mark recently seen), drop the newcomer,
+	// but remember the new contact in the replacement cache.
+	for e := b.list.Back(); e != nil; e = e.Prev() {
+		if e.Value.(Contact).ID.Equals(lru.ID) {
+			b.list.MoveToFront(e)
+			break
+		}
+	}
+	b.addReplacement(contact)
+
 }
 
 // FindClosestContacts finds the count closest Contacts to the target in the RoutingTable

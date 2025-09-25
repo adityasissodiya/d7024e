@@ -210,6 +210,46 @@ func (network *Network) SendPingMessage(contact *Contact) {
 	}
 }
 
+// PingWait sends a PING and returns true iff we got a PONG before timeout.
+// NOTE: Unlike SendPingMessage, callers expect a boolean and we avoid side-effects
+// beyond the usual routingTable refresh on success.
+func (network *Network) PingWait(contact *Contact, timeout time.Duration) bool {
+	if contact == nil || contact.Address == "" {
+		return false
+	}
+	dst, err := net.ResolveUDPAddr("udp", contact.Address)
+	if err != nil {
+		return false
+	}
+	env := envelope{
+		Type:  msgPing,
+		From:  fromContact(network.kademlia.me),
+		MsgID: network.nextMsgID(),
+	}
+	ch := make(chan envelope, 1)
+	network.mu.Lock()
+	network.inflight[env.MsgID] = ch
+	network.mu.Unlock()
+	defer func() {
+		network.mu.Lock()
+		delete(network.inflight, env.MsgID)
+		network.mu.Unlock()
+	}()
+	if err := network.send(dst, env); err != nil {
+		return false
+	}
+	select {
+	case <-ch:
+		// handlePing already refreshed the sender in our table; also keep the callee.
+		if network.kademlia != nil && network.kademlia.routingTable != nil {
+			network.kademlia.routingTable.AddContact(*contact)
+		}
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // SendFindContactMessage asks the *peer* "contact" for nodes close to *contact.ID*.
 // (Good for simple refresh. For iterative lookup with an arbitrary target, we add
 // a more explicit helper below.)
