@@ -10,7 +10,7 @@ Two issues were making the DHT behave poorly:
 * No **path caching**, so successful lookups didn’t seed closer nodes.
 * The UDP `readLoop` didn’t route `FIND_VALUE_OK` / `STORE_OK` back to waiting goroutines, so some lookups timed out even when peers responded.
 
-**What we changed:**
+**What changed:**
 
 * **Response routing:** `network.go` `readLoop` now also forwards `msgFindValueOK` and `msgStoreOK` to the pending request channels (in addition to `PONG`/`FIND_NODE_OK`).
   *File:* `labs/kademlia/network.go` (read loop).
