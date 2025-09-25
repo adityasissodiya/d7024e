@@ -1,321 +1,342 @@
-# d7024e – CLI User Guide (M1–M3)
+# D7024E Kademlia
 
-* **M1:** network formation (ping, join, node lookup)
-* **M2:** value distribution (put/get)
-* **M3:** command-line interface (this guide)
-
----
+This lab is a full Kademlia DHT implementation with a CLI, tests, large-scale emulation, concurrency/thread-safety, and containerization.
 
 ## Architecture Diagram
 
 ![Kademlia Architecture](labs/docs/kademlia_architecture.svg)
 
+**Mapping work to the rubric:**
 
-## 1) Prerequisites
-
-* **Go** installed (1.21+ recommended).
-* This repository checked out locally.
-* Run commands from the **repo root**:
-  `C:\Users\<you>\Downloads\D7024E\d7024e` (Windows)
-  or `~/D7024E/d7024e` (macOS/Linux).
-
-> If you use PowerShell on Windows, mind the examples labeled “PowerShell”. Bash/zsh users can copy the *macOS/Linux* snippets.
+* **M1 (Network formation):** PING, join, and node lookup implemented to form/maintain the network. 
+* **M2 (Object distribution):** `put` stores to K-closest; `get` retrieves via iterative FIND_VALUE with path caching and periodic republish (see §2). 
+* **M3 (CLI):** `put <text>`, `get <key>`, `exit`. (Shown in demos and Docker quickstart below.) 
+* **M4 (Unit tests & emulation ≥1000 nodes + drop%):** Large-scale simulator + coverage instructions (see §4–§5).  
+* **M5 (Containerization ≥50 containers):** Compose-driven bring-up with one seed + N scalable nodes (see §7). 
+* **M6 (Lab report):** This readme anchors the system architecture/implementation overview the report asks for. 
+* **M7 (Concurrency & thread safety):** Explicit design and invariants (see §3). 
 
 ---
 
-## 2) Building / Running the CLI
+## 1) Code orientation (what’s where)
 
-The CLI runner lives at:
-`labs/kademlia/cmd/cli/main.go`
+* `labs/kademlia/…`: core DHT—routing table, UDP network, iterative lookups, store/cache, CLI.
+* `labs/kademlia/cmd/cli`: the node/CLI entrypoint (`put/get/exit`).
+* Tests:
 
-### Option A: run directly
+  * Unit & integration tests for M1–M3 live alongside the code.
+  * Large-scale simulator tests (M4) provide 1000–2000 node emulation with packet drop knobs; they don’t touch production code. 
+* Container artifacts:
 
-**Windows (PowerShell):**
+  * `labs/Dockerfile`, `labs/docker-compose.yml`, `labs/docker/entrypoint.sh`. 
+
+Two correctness/operational problems were addressed:
+
+### New nodes couldn’t find values stored **before** they joined
+
+**Root causes:** one-shot replication at put-time only; no periodic republish; no path caching; and read-loop didn’t route some OK responses back to waiters.
+**Fixes:**
+
+* Route `FIND_VALUE_OK`/`STORE_OK` in `readLoop` to the proper inflight waiter.
+* Add a **republisher** goroutine to periodically re-replicate origin keys to **current** K-closest nodes (eventual placement).
+* Add **path caching** on successful `get` (store to the best candidate we queried).
+* Provide a unified `replicateToClosest()` helper used by both initial `put` and republish. 
+
+**Result:** New nodes **eventually** discover old data without manual re-`put`; often immediately via path caching. 
+
+### Routing buckets didn’t evict stale nodes
+
+**Root cause:** no Kademlia LRU ping/evict policy; full buckets silently dropped newcomers, letting dead entries linger.
+**Fixes:** Full Kademlia behavior: ping **LRU**; if dead, **evict** and insert newcomer; if alive, **keep** LRU and cache newcomer in a **replacement cache**. Pings happen **outside** the routing table lock. Tests verify both dead-LRU and alive-LRU cases. 
+
+## 2) Concurrency & thread-safety (M7)
+
+**Concurrency mechanisms used:**
+
+* **Goroutines** for UDP read-loop and per-peer RPCs (α-parallel fan-out during lookups).
+* **Channels** to correlate request/response via inflight map keyed by MsgID.
+* **Mutex/RWMutex** to guard shared structures (routing table, inflight map, value store).
+* **Timeouts** on all waits to prevent leaks and livelocks.
+* **Background republisher** goroutine—ticker-driven, never performs network I/O while holding data locks. 
+
+**Thread-safety invariants:**
+
+* Every mutable map/list is behind a lock; **no network I/O while holding high-level locks** (evictions ping outside the lock; republisher releases locks before RPCs).
+* Read-loop never blocks: waiter channels are size-1; select with default avoids deadlocks if caller timed out.
+* Store loads/stores copy byte slices to avoid cross-goroutine aliasing.
+* Single socket reader (the read-loop) simplifies synchronization. 
+
+Predictable throughput/latency, low deadlock risk, correctness under churn (routing updates safe; eviction probes liveness safely; republishing respects locks). Validation: run with `-race`; hammer lookups while starting/stopping peers—read-loop should never stall. 
+
+## 3) Debugging with Delve (Windows-proof, copy/paste)
+
+Delve steps for M1/M2 with reliable Windows command forms, including building an unoptimized test binary and a minimal dlv command set. Includes pre-made breakpoint/trace scripts and “tour” flows (M2 happy path, concurrent GETs, M1 Ping/Lookup). 
+
+**TL;DR:**
 
 ```powershell
-cd \d7024e\labs\kademlia\cmd\cli
-
-# Terminal 1 – start a node that listens on 127.0.0.1:9001
-go run . -addr 127.0.0.1:9001
-
-# Terminal 2 – start another node and bootstrap to the first
-go run . -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
+# from: ...\d7024e\labs\kademlia
+go test -c -gcflags=all="-N -l" -o m1m2.test.exe
+dlv exec .\m1m2.test.exe --% -- -test.run=TestM2_PutAndGet_SucceedsAcrossNetwork -test.v=true -test.count=1 -test.timeout=60s
+# (dlv) paste:
+clearall
+b (*Kademlia).Put
+b (*Kademlia).Get
+trace (*Network).sendStoreTo
+trace (*Network).handleStore
+trace (*Network).sendFindValueTo
+trace (*Network).handleFindValue
+config max-string-len 256
+c
 ```
 
-**macOS/Linux (bash/zsh):**
+## 4) Unit testing & coverage (M4)
+
+**Run everything from the package directory**: `…\d7024e\labs\kademlia`. Guidance includes reliable PowerShell commands for coverage, HTML reports, and race detector on Windows (with MSYS2 GCC). Also has filtered runs for only M1/M2/M3 tests. 
+
+**Quick coverage:**
+
+```powershell
+cd C:\Users\adisis\Downloads\D7024E\d7024e\labs\kademlia
+go test . -count=1 -timeout=120s -cover
+```
+
+**Full profile + HTML (Windows-robust):**
+
+```powershell
+$path = "C:\Users\adisis\Downloads\D7024E\d7024e\labs\kademlia\coverage.out"
+cmd /c "go test . -count=1 -timeout=120s -covermode=atomic -coverpkg=./... -coverprofile=""$path"""
+go tool cover -func "$path"
+go tool cover -html "$path" -o "C:\Users\adisis\Downloads\D7024E\d7024e\labs\kademlia\coverage.html"
+```
+
+## 5) Large-scale emulation (M4: 1000–2000 nodes + packet drop)
+
+A **test-only simulator** drives 1000+ nodes and applies a configurable **drop %** to deliveries—no runtime code changes. Flags: `-m4.nodes`, `-m4.drop`, `-m4.seed`. Commands for both PS and bash are provided; defaults are 1000 nodes/10% drop. 
+
+**Examples (PowerShell):**
+
+```powershell
+cd .\labs\kademlia
+# Default 1000 nodes, 10% drop
+go test . -count=1 -timeout=180s -run '^TestM4_Simulation_'
+
+# 2000 nodes, 30% drop, deterministic seed
+go test . -count=1 -timeout=300s -run '^TestM4_Simulation_' "-m4.nodes=2000" "-m4.drop=30" "-m4.seed=42"
+```
+
+Why a simulator? Because 1000+ UDP sockets on localhost is brittle; simulator is fast/deterministic and keeps production code untouched. We still exercise **K-closest replication** and **FIND_VALUE** under drop. 
+
+Short answer: you already have packet drop in the **M4 simulator**. It’s implemented in the test harness (not in the real UDP stack), and it’s applied in three places:
+
+* during **STORE** replication (put path),
+* on **FIND_VALUE** request delivery (get path),
+* on **FIND_VALUE** response delivery (get path).
+
+### Where packet drop lives (and how it’s wired)
+
+* **Flags (knobs):**
+  `-m4.nodes` (default 1000), `-m4.drop` (percent 0..100, default 10), `-m4.seed` (PRNG seed). These are parsed for all M4 sim tests. 
+
+* **Drop function:**
+
+  ```go
+  func (c *simCluster) dropped() bool { ... return p < c.dropPct }
+  ```
+
+  Uses a deterministic `math/rand` (seeded) guarded by a mutex; returns true with probability `dropPct%`. 
+
+* **Drop applied on `put` (replication):**
+  In `simPut`, after choosing the K closest nodes to the key, each **STORE** to a peer is skipped if `dropped()` returns true. Origin is always stored locally (no drop). Resulting `replicatedTo` reflects how many actually received the value. 
+
+* **Drop applied on `get` (lookup):**
+  In `simGet`, the simulator iterates the K closest nodes. For each candidate:
+
+  * It may drop the **request** (`if c.dropped() { continue }`),
+  * If the node has the value, it may still drop the **response** (`if c.dropped() { continue }`).
+    Any successful request+response returns the value immediately. 
+
+* **Tests that exercise it:**
+
+  * **No drop** happy path over 1000 nodes: all sampled gets succeed; verifies replication hits full K under 0%. 
+  * **With drop**: replication ≥ 1 (origin), several vantage-point gets should still succeed deterministically under the seed (also logs an expected lower bound). 
+  * **Many keys / different origins** with your current `-m4.drop` default—cross-checks retrieval robustness. 
+
+From the package with the tests (the simulator lives with the kademlia code):
+
+```powershell
+# Default (1000 nodes, 10% drop, seed 1337)
+go test . -count=1 -timeout=180s -run '^TestM4_Simulation_'
+```
+
+Turn off drop:
+
+```powershell
+go test . -count=1 -timeout=180s -run '^TestM4_Simulation_NoDrop_' -m4.drop=0
+```
+
+Crank it up (2000 nodes, 35% drop, deterministic seed):
+
+```powershell
+go test . -count=1 -timeout=300s -run '^TestM4_Simulation_WithDrop_StillRetrievable$' -m4.nodes=2000 -m4.drop=35 -m4.seed=42
+```
+
+Edge cases:
+
+```powershell
+# Validate input sanitization & key-shape handling (invalid hex)
+go test . -count=1 -timeout=60s -run '^TestM4_Simulation_InvalidKey_NotFound$'
+```
+
+* ✅ **Is**: a **test-only** simulation of lossy networks. It’s deterministic (seeded PRNG), fast, and lets you emulate 1000–2000 nodes without binding real sockets. Drop is modeled on the logical edges: STORE deliveries and FIND_VALUE request/response legs. 
+
+* ❌ **Is not**: real UDP loss in runtime network code. The production `network.go` isn’t modified to drop packets. 
+
+* We have packet drop in the M4 simulation, and it’s applied on both **replication** and **lookup** codepaths with a deterministic PRNG and a user-settable `-m4.drop` percent. See `dropped()`, its use in `simPut` and `simGet`, and the M4 tests.  
+
+## 6) Containerization (M5): run 50+ containers on one machine
+
+Compose spins one **seed** plus **N knodes** on a private bridge network. Entrypoint computes the **container IP** and announces it (`-addr <ip:9000>`). The image builds in **GOPATH mode** and mirrors `labs/kademlia` to `/go/src/d7024e/kademlia`, matching imports like `d7024e/kademlia`. **You can scale to ≥50** with one flag. 
+
+**Run from `d7024e\labs` (recommended):**
+
+```powershell
+# Build images
+docker compose build --no-cache
+
+# Bring up 1 seed + 50 nodes
+docker compose up -d --scale knode=50
+
+# See containers and follow seed logs
+docker compose ps
+docker compose logs -f seed
+```
+
+**Interact (seed has TTY):**
+
+```powershell
+docker attach $(docker compose ps -q seed)
+# in the CLI:
+put hello container world   # -> prints 40-hex key
+# Ctrl+P, Ctrl+Q to detach without killing the seed
+```
+
+**Scale up/down:**
+
+```powershell
+docker compose up -d --scale knode=100   # scale up
+docker compose up -d --scale knode=20    # scale down
+```
+
+**Tear down:**
+
+```powershell
+docker compose down        # remove containers + network
+docker compose down -v     # also remove anonymous volumes
+```
+
+**Why this setup works:**
+
+* Every node announces its **real container IP**, so UDP is routable inside the bridge.
+* Build context is the repo root; Dockerfile/compose are under `labs/`.
+* Entrypoint handles `seed` vs `node` startup, waits for Docker DNS on `seed`.
+  (More troubleshooting and optional manual `docker run` flow in the Docker guide.) 
+
+---
+
+## 7) Demos (end-to-end)
+
+**Local (two terminals):**
 
 ```bash
-cd ~/D7024E/d7024e
-
-# Terminal 1
+# T1
 go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
-
-# Terminal 2
+# T2
 go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
-```
-
-### Option B: build a reusable binary
-
-```bash
-# from repo root
-go build -o kcli ./labs/kademlia/cmd/cli
-
-# then
-./kcli -addr 127.0.0.1:9001
-./kcli -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
-```
-
-You should see a banner like:
-
-```
-node up: id=<40-hex> addr=127.0.0.1:9001
-commands: put <text> | get <40-hex-key> | exit
-```
-
----
-
-## 3) CLI Commands (what to type, what to expect)
-
-The CLI supports **three** commands:
-
-### `put <text>`
-
-* **What it does:** hashes `<text>` with SHA-1 to produce a **40-hex key**, stores the value **locally**, and **replicates** it to the **K closest** nodes to that key.
-* **What you see:** the **key** printed on its own line (exactly 40 hex chars).
-* **Example:**
-
-  ```
-  put hello world
-  ```
-
-  Output:
-
-  ```
-  2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
-  ```
-
-### `get <40-hex-key>`
-
-* **What it does:** tries to fetch the value by key. If not local, performs an iterative **FIND\_VALUE** lookup. On success, **prints the value** and the node it came **from**, then **caches** it locally.
-
-* **What you see:** the **value** on one line and a `from <addr>` line.
-
-* **Example (in another terminal/node):**
-
-  ```
-  get 2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
-  ```
-
-  Output:
-
-  ```
-  hello world
-  from 127.0.0.1:9002
-  ```
-
-* **If not found:** prints `NOTFOUND`.
-
-### `exit`
-
-* **What it does:** terminates the CLI/node.
-* **What you see:** no output; the process exits cleanly.
-
----
-
-## 4) What happens under the hood (short tour)
-
-### When you start a node
-
-* The node binds a UDP socket at `-addr` and starts the network read loop.
-* If `-bootstrap` is provided (and differs from your `-addr`):
-
-  * Sends a **PING** to learn/refresh routing info.
-  * Performs a lookup to warm the routing table (so queries have useful peers).
-
-### On `put <text>`
-
-1. Compute the **key** = SHA-1(`<text>`) → 20 bytes (printed as 40-hex).
-2. **Store locally** immediately (origin keeps a copy).
-3. Perform a **node lookup** for that **key** to find the **K closest** peers.
-4. Send **STORE** RPC to those peers (replication).
-
-### On `get <key>`
-
-1. Check local store. If hit → return immediately.
-2. Otherwise, perform **FIND\_VALUE** iterative lookup.
-
-   * If a peer returns a **value**, stop early and return it.
-   * Cache the value **locally** (helps future reads).
-3. If no peer has it → print `NOTFOUND`.
-
----
-
-## 5) Single-node and multi-node demos
-
-### Single node (everything local)
-
-```bash
-go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
-# In the CLI:
+# In T1 or T2:
 put lorem ipsum
-# copy key
-get <that-key>     # still works (local)
-exit
+# copy key; on the other terminal:
+get <that 40-hex key>
 ```
 
-### Two nodes (replication and remote fetch)
-
-* Node A:
-
-  ```bash
-  go run . -addr 127.0.0.1:9001
-  ```
-* Node B:
-
-  ```bash
-  go run . -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
-  ```
-* In **Node B** CLI:
-
-  ```
-  put distributed systems are fun
-  ```
-
-  Copy the key.
-* In **Node A** CLI:
-
-  ```
-  get <that-key>
-  ```
-
-  You should see:
-
-  ```
-  distributed systems are fun
-  from 127.0.0.1:9002
-  ```
-
----
-
-## 6) Flags (node startup)
-
-* `-addr <host:port>`
-  UDP listen address for this node. Example: `-addr 127.0.0.1:9001`
-* `-bootstrap <host:port>` *(optional)*
-  Another node to join. Example: `-bootstrap 127.0.0.1:9001`
-* `-id <40-hex>` *(optional)*
-  Force a specific node ID (otherwise a random ID is used).
-
-> IDs are 160-bit (20 bytes), shown as 40-char hex.
-
-**Values only get placed on the “responsible” nodes at *put time***. If a node didn’t exist (or wasn’t known) then, it won’t magically have those values later. And your `get` walks toward the nodes **closest (by XOR) to the key**, not “whoever might have it.” So after you bring up B, some of A’s old keys won’t be discoverable from B unless you re-publish them.
-
-* **A put values before B existed.** At that moment A only knew itself, so replication placed the value **on A only** (origin always keeps a copy; it can’t send to peers it doesn’t know).
-* Later if **bootstrapped B to A** and tried `get` from B for A’s earlier keys.
-  The `get` does a Kademlia lookup toward the nodes **closest to the key** (by XOR distance). If A isn’t among those “K closest” from B’s point of view, B won’t even ask A, so you get `NOTFOUND`.
-
-Why one direction works but not the other:
-
-* Key from **B → A succeeds**: when we `put` on B (after bootstrap), B’s replication sends to the K closest—**A was in that set**, so A got a replica. Then `get` on A works (A even serves it locally, hence `from 127.0.0.1:9001`).
-* Key from **A → B fails** (for your “Aditya” key): when A stored it, B didn’t exist, so only A had it. After B joins, the lookup from B heads toward nodes closest to that key—**and for that specific key, B is closer than A**, so the search doesn’t hit A and returns `NOTFOUND`.
-
-### So, will B be able to fetch values A put **before** bootstrap?
-
-* **Not guaranteed.** It only works if A happens to be among the K closest to that key (so B’s lookup reaches A). Otherwise you’ll see `NOTFOUND`.
-* The lab code (sensibly) doesn’t do background **republish/refresh**, so old values don’t move to the now-responsible nodes after the network changes.
-
-That’s the whole story: **placement is decided at publish time; lookup is proximity-driven.** If we publish while alone, the data is marooned until we republish (or the implementation has periodic republish/refresh, which it doesn’t).
-
----
-
-## 7) Capabilities
-**What you can do**
-
-* Start multiple nodes on localhost, join them, and form a Kademlia network.
-* `put` arbitrary **text** and get back its content-address (SHA-1) key.
-* `get` by key from any node; see which peer served it.
-* Values automatically **replicate** to K closest nodes on `put`.
-* Values fetched via `get` are **cached locally**.
-
----
-
-## 8) Tips, gotchas, troubleshooting
-
-* **“flag provided but not defined: -addr”**
-  You passed flags to `go run` instead of your program. Correct usage:
-
-  ```powershell
-  go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
-  #             ^ package path first, then flags
-  ```
-
-* **“directory not found … labs\kademlia\labs\kademlia”**
-  You were already in `labs/kademlia` and doubled the path. From repo root, use:
-
-  ```powershell
-  go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
-  ```
-
-  From the CLI folder itself, use:
-
-  ```powershell
-  cd labs\kademlia\cmd\cli
-  go run . -addr 127.0.0.1:9001
-  ```
-
-* **Nothing happens on `get`**
-  Make sure the node where you ran `put` is still running and that the second node was started with a **valid** `-bootstrap` that points to the first node.
-
-* **Whitespace in `put`**
-  Everything after `put` is treated as raw content (including spaces).
-  Example: `put   hello   spaced   world` is valid.
-
-* **NOTFOUND**
-  Means no peer among the queried set had the value (or the origin died before replication and no cache exists yet).
-
----
-
-## 9) Reference: what the CLI maps to (internals)
-
-* `put <text>`
-  → `Kademlia.Put([]byte(text))`
-  → `storeLocal` (origin) + **find K closest** + **STORE** RPCs to those peers.
-
-* `get <key>`
-  → `Kademlia.Get(key)`
-  → `loadLocal` check → **FIND\_VALUE** iterative lookup → **cache** (storeLocal) → print `from <addr>`.
-
-* `exit`
-  → triggers the provided quit function and terminates the process.
-
-You don’t need to call these functions directly—the CLI does it for you.
-
----
-
-## 10) Non-interactive (piped) usage
-
-Useful for scripts:
-
-**Windows (PowerShell):**
+**Containerized (seed attach):**
 
 ```powershell
-"put hello via pipe`nexit`n" | go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
+docker attach $(docker compose ps -q seed)
+put hello 50-node net
+# test a get on any knode (or just watch logs for FIND_VALUE)
 ```
 
-**macOS/Linux:**
-
-```bash
-printf "put hello via pipe\nexit\n" | go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
-```
+(Behavior improvements—republisher + path caching + response routing—and their verification are described in §2.) 
 
 ---
 
-## 11) Where to look in the code
-
-* `labs/kademlia/cli.go` — the CLI wrapper (parses `put/get/exit`, prints results).
-* `labs/kademlia/kademlia.go` — `Put`, `Get`, local store/cache.
-* `labs/kademlia/network.go` — UDP messaging, PING/PONG, STORE, FIND\_VALUE.
-* `labs/kademlia/routingtable.go` — routing logic, closest K selection.
-* `labs/kademlia/m1_network_test.go`, `m2_value_test.go`, `m3_cli_test.go` — tests that define and validate behavior.
+* **Spec alignment:** All mandatory goals M1–M7 have concrete implementations and commands; qualifying goals like U1–U6 can layer on top (TTL/refresh/forget, REST API, higher coverage, full routing tree). Cite this handbook + course spec in the lab report. 
+* **Operational sanity:** With the fixes, lookups will not silently time out if peers respond; buckets self-heal; values placed before topology changes eventually migrate to the responsible region. 
+* **Thread-safety story:** Locks around data, never around network; single socket reader; bounded channels + timeouts; copy semantics for stored bytes. Run `-race` to validate. 
+* **Coverage:** Commands to generate numbers and HTML are in §5; Windows-robust one-liners are provided. 
+* **Debuggability:** Delve recipes for M1/M2 with precise break/trace points (Windows included). 
+* **Scalability:** M4 simulator covers 1000–2000 nodes with drop%; M5 brings 50–100+ real containers.  
 
 ---
+
+## Appendix A — One-page quickstart
+
+```powershell
+# from d7024e\labs
+docker compose build --no-cache
+docker compose up -d --scale knode=50
+docker compose ps
+docker compose logs -f seed
+docker attach $(docker compose ps -q seed)   # put/get here; Ctrl+P,Ctrl+Q to detach
+```
+
+
+
+---
+
+## Appendix B — M4 simulator commands (copy/paste)
+
+```powershell
+cd .\labs\kademlia
+go test . -count=1 -timeout=180s -run '^TestM4_Simulation_'
+go test . -count=1 -timeout=300s -run '^TestM4_Simulation_' "-m4.nodes=2000" "-m4.drop=30" "-m4.seed=42"
+```
+
+
+
+---
+
+## Appendix C — Coverage on Windows (robust)
+
+```powershell
+cd C:\Users\adisis\Downloads\D7024E\d7024e\labs\kademlia
+$path = "$pwd\coverage.out"
+cmd /c "go test . -count=1 -timeout=120s -covermode=atomic -coverpkg=./... -coverprofile=""$path"""
+go tool cover -func "$path"
+go tool cover -html "$path" -o "$pwd\coverage.html"
+```
+
+
+
+---
+
+## Appendix D — Delve “tour” (paste into `(dlv)`)
+
+```
+clearall
+b (*Kademlia).Put
+b (*Kademlia).Get
+trace (*Network).sendStoreTo
+trace (*Network).handleStore
+trace (*Network).sendFindValueTo
+trace (*Network).handleFindValue
+config max-string-len 256
+c
+```
+
+
+
+---
+
+**That’s the whole project in one place:** the spec targets, what changed and why, how we keep it thread-safe under churn, how to test/simulate/cover/debug, and how to bring up a 50+ container network that behaves like a real DHT.

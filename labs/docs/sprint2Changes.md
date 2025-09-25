@@ -1,5 +1,3 @@
-# What we fixed
-
 Two issues were making the DHT behave poorly:
 
 ## 1) New nodes couldn’t find values stored **before** they joined
