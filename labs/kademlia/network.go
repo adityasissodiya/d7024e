@@ -68,6 +68,8 @@ func (network *Network) send(to *net.UDPAddr, env envelope) error {
 	if err != nil {
 		return err
 	}
+	// Wire-level send—pairs with your REPLICATE logs.
+	fmt.Printf("[NET] => %s msg=%s to=%s\n", env.Type, env.MsgID, to.String())
 	_, err = network.conn.WriteToUDP(b, to)
 	return err
 }
@@ -85,8 +87,16 @@ func (network *Network) readLoop() {
 			continue
 		}
 
+		fmt.Printf("[NET] <= %s msg=%s from=%s\n", env.Type, env.MsgID, env.From.Address)
+
 		// Response path: deliver to waiter
-		if env.Type == msgPong || env.Type == msgFindNodeOK {
+		//
+		// IMPORTANT:
+		// - sendStoreTo waits for STORE_OK
+		// - sendFindValueTo waits for FIND_VALUE_OK (with either Value or Contacts)
+		// If we don't forward these, callers will time out spuriously.
+		if env.Type == msgPong || env.Type == msgFindNodeOK ||
+			env.Type == msgFindValueOK || env.Type == msgStoreOK {
 			network.mu.Lock()
 			ch := network.inflight[env.MsgID]
 			network.mu.Unlock()
@@ -130,6 +140,7 @@ func (network *Network) handlePing(env envelope, src *net.UDPAddr) {
 		MsgID: env.MsgID, // echo the request ID back
 	}
 	_ = network.send(src, reply)
+	fmt.Printf("[PING] from=%s -> PONG\n", env.From.Address)
 }
 
 // FIND_NODE handler -> FIND_NODE_OK
@@ -156,12 +167,14 @@ func (network *Network) handleFindNode(env envelope, src *net.UDPAddr) {
 		reply.Contacts = append(reply.Contacts, fromContact(c))
 	}
 	_ = network.send(src, reply)
+	fmt.Printf("[FIND_NODE] from=%s target=%s returning %d contacts\n", env.From.Address, env.TargetID, len(contacts))
 }
 
 // -------- Public methods kept from your skeleton --------
 
 // SendPingMessage sends a PING to the given peer and waits for PONG.
 func (network *Network) SendPingMessage(contact *Contact) {
+	fmt.Printf("[PING=>] to=%s\n", contact.Address)
 	if contact == nil || contact.Address == "" {
 		return
 	}
@@ -209,6 +222,7 @@ func (network *Network) SendFindContactMessage(contact *Contact) {
 
 // Explicit helper used by LookupContact: ask "peer" for nodes close to "target".
 func (network *Network) SendFindContactMessageTo(peer *Contact, target *Contact) ([]Contact, error) {
+	fmt.Printf("[FIND_NODE=>] peer=%s target=%s\n", peer.Address, target.ID.String())
 	if peer == nil || peer.Address == "" || target == nil || target.ID == nil {
 		return nil, fmt.Errorf("bad args")
 	}
@@ -281,6 +295,7 @@ func (network *Network) handleStore(env envelope, src *net.UDPAddr) {
 		From:  fromContact(network.kademlia.me),
 		MsgID: env.MsgID,
 	})
+	fmt.Printf("[STORE] from=%s key=%s saved=true\n", env.From.Address, env.KeyHex)
 }
 
 func (network *Network) handleFindValue(env envelope, src *net.UDPAddr) {
@@ -296,6 +311,7 @@ func (network *Network) handleFindValue(env envelope, src *net.UDPAddr) {
 			KeyHex: env.KeyHex,
 			Value:  val,
 		})
+		fmt.Printf("[FIND_VALUE] HIT key=%s from=%s returning VALUE\n", env.KeyHex, env.From.Address)
 		return
 	}
 
@@ -317,11 +333,13 @@ func (network *Network) handleFindValue(env envelope, src *net.UDPAddr) {
 			Contacts: out,
 		})
 	}
+
 }
 
 // ---------- M2 client helpers (internal) ----------
 
 func (network *Network) sendStoreTo(peer *Contact, keyHex string, value []byte, timeout time.Duration) error {
+	fmt.Printf("[STORE=>] to=%s key=%s\n", peer.Address, keyHex)
 	if peer == nil || peer.Address == "" {
 		return fmt.Errorf("bad peer")
 	}
@@ -354,6 +372,7 @@ func (network *Network) sendStoreTo(peer *Contact, keyHex string, value []byte, 
 }
 
 func (network *Network) sendFindValueTo(peer *Contact, keyHex string, timeout time.Duration) (val []byte, contacts []Contact, err error) {
+	fmt.Printf("[FIND_VALUE=>] to=%s key=%s\n", peer.Address, keyHex)
 	if peer == nil || peer.Address == "" {
 		return nil, nil, fmt.Errorf("bad peer")
 	}
