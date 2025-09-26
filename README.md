@@ -1,6 +1,6 @@
 # D7024E Kademlia
 
-This lab is a full Kademlia DHT implementation with a CLI, tests, large-scale emulation, concurrency/thread-safety, and containerization.
+This project is a **distributed key-value store**. You give it some text, it **hashes** it (SHA-1) to a 40-hex “key” and stores the text across the network. Later, anyone with the key can fetch the text. There’s no central server; **many small programs (nodes)** cooperate to store and find stuff. The algorithm they use to find each other fast is **Kademlia**.
 
 ## Architecture Diagram
 
@@ -16,59 +16,215 @@ This lab is a full Kademlia DHT implementation with a CLI, tests, large-scale em
 * **M6 (Lab report):** This readme anchors the system architecture/implementation overview the report asks for. 
 * **M7 (Concurrency & thread safety):** Explicit design and invariants (see §3). 
 
+## 1) Booting a node
+
+**Command:**
+
+```bash
+go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9001
+```
+
+### CLI spins up the engine
+
+* **`cmd/cli/main.go`**
+
+  * Parses flags: `-addr`, `-bootstrap` (optional), `-id` (optional).
+  * Builds `me` (your **Contact**) with a 160-bit **KademliaID** and string **Address** `"127.0.0.1:9001"`.
+  * Calls **`kademlia.NewKademlia(me, ip, port)`**.
+
+### Kademlia constructs subsystems
+
+* **`kademlia.go : NewKademlia`**
+
+  * Creates **routing table**: `routingtable.NewRoutingTable(me)`.
+  * Starts **network stack**: `network.NewNetwork(kademlia, ip, port)` → binds a UDP socket.
+  * Wires LRU-eviction liveness probe: `routingTable.SetPingFunc(c → network.PingWait(&c, timeout))`.
+  * Starts background **republisher goroutine** (ticker).
+* **`network.go : NewNetwork`**
+
+  * Opens `net.UDPConn` on `127.0.0.1:9001`.
+  * Spawns **`readLoop()`** goroutine that continuously:
+
+    1. `ReadFromUDP` → raw bytes
+    2. **`wire.go : envelope.unmarshal`** → parse message
+    3. If it’s a **response** (`PONG`, `FIND_NODE_OK`, `FIND_VALUE_OK`, `STORE_OK`) → deliver to waiting goroutine via **`inflight[msgID] <- env`**
+       (this is the waiter map keyed by `MsgID`, protected by `network.mu`)
+    4. If it’s a **request** (`PING`, `FIND_NODE`, `FIND_VALUE`, `STORE`) → call corresponding **handler**.
+
+### Optional bootstrap (when `-bootstrap` is given)
+
+```bash
+go run ./labs/kademlia/cmd/cli -addr 127.0.0.1:9002 -bootstrap 127.0.0.1:9001
+```
+* **`network.go : SendPingMessage(bootstrap)`** to learn/refresh.
+* **`kademlia.go : LookupContact(&myID)`** (or a similar warmup) so your table isn’t empty: internally issues `FIND_NODE` to neighbors and adds returned contacts.
+* **`routingtable.go : AddContact`** handles insertion/eviction:
+
+  * If bucket has room → insert MRU.
+  * If full → **ping LRU** (outside the lock).
+
+    * If **dead** → evict and insert newcomer.
+    * If **alive** → keep LRU; put newcomer in **replacement cache**.
+
+> At this point the node is “up”: UDP reader running, routing table initialized, and the CLI shows the banner.
+
+## 2) `put <text>` — publishing data
+
+### CLI takes your input
+
+* **`cli.go : runREPL`** reads a line, recognizes `put <rest-of-line>`, converts to `[]byte`, calls:
+
+  * **`kademlia.go : (*Kademlia).Put(data)`**
+
+### Put: compute key, store locally, replicate
+
+* **`kademlia.go : Put`**
+
+  1. **`keyFromData`**: SHA-1 of the bytes → 20-byte key; printed as **40-hex**.
+  2. **`storeLocal(keyHex, data)`**:
+
+     * Locks `storeMu`, copies the value, writes to `valueStore[keyHex]`. (Origin always keeps a copy.)
+  3. Marks this `keyHex` in `originKeys` so the **republisher** will maintain it.
+  4. **`replicateToClosest(keyHex, keyID, data)`**:
+
+     * **Refresh view** near the key: `LookupContact(&target=keyID)` (iterative `FIND_NODE`) so the table contains the right neighbors around that key.
+     * **`routingtable.FindClosestContacts(keyID, K)`** → the K best peers.
+     * For each peer (skip self) → **`network.sendStoreTo(peer, keyHex, data, timeout)`** (fire many in parallel or sequentially, depending on your implementation).
+
+### What a **STORE** looks like on the wire
+
+* **Sender path (`sendStoreTo`)**
+
+  * Build **`wire.envelope{Type: STORE, From: me, MsgID, KeyHex, Value}`**.
+  * Register a **waiter channel**: `inflight[msgID] = ch`.
+  * **`send()`**: `env.marshal()` → `conn.WriteToUDP`.
+  * `select` for either `STORE_OK` on `ch` or `time.After(timeout)`.
+* **Receiver path (`handleStore`)**
+
+  * **`kademlia.storeLocal(keyHex, value)`** (now the replica holds it).
+  * **Reply** with **`STORE_OK`** envelope (same `MsgID`).
+  * **`routingTable.AddContact(env.From)`** (we learned a sender; keep table fresh).
+
+> **Result:** the value now lives on the K nodes **closest by XOR distance to the key**, plus the origin. The **republisher goroutine** (in `kademlia.go`) will periodically redo the *same* replication to the **current** closest—so if the network changed, the data “migrates” toward the right place.
+
 ---
 
-## 1) Code orientation (what’s where)
+## 3) `get <40-hex-key>` — retrieving data
 
-* `labs/kademlia/…`: core DHT—routing table, UDP network, iterative lookups, store/cache, CLI.
-* `labs/kademlia/cmd/cli`: the node/CLI entrypoint (`put/get/exit`).
-* Tests:
+### CLI calls Get
 
-  * Unit & integration tests for M1–M3 live alongside the code.
-  * Large-scale simulator tests (M4) provide 1000–2000 node emulation with packet drop knobs; they don’t touch production code. 
-* Container artifacts:
+* **`cli.go → kademlia.go : (*Kademlia).Get(keyHex)`**
 
-  * `labs/Dockerfile`, `labs/docker-compose.yml`, `labs/docker/entrypoint.sh`. 
+### Get: local check → iterative network search
 
-Two correctness/operational problems were addressed:
+* **`kademlia.go : Get`**
 
-### New nodes couldn’t find values stored **before** they joined
+  1. **Parse** `keyHex` → `KademliaID`.
+  2. **Local cache**: `loadLocal`; if hit → return instantly (and CLI prints the value + `from <addr>`).
+  3. Otherwise, start **iterative lookup** toward the key:
 
-**Root causes:** one-shot replication at put-time only; no periodic republish; no path caching; and read-loop didn’t route some OK responses back to waiters.
-**Fixes:**
+     * Prepare a **visited set**.
+     * **Pick α** unvisited contacts closest to the key from `routingtable.FindClosestContacts` → this is your **batch**.
+     * For each peer in the batch, kick off a goroutine: **`network.sendFindValueTo(peer, keyHex, timeout)`**.
 
-* Route `FIND_VALUE_OK`/`STORE_OK` in `readLoop` to the proper inflight waiter.
-* Add a **republisher** goroutine to periodically re-replicate origin keys to **current** K-closest nodes (eventual placement).
-* Add **path caching** on successful `get` (store to the best candidate we queried).
-* Provide a unified `replicateToClosest()` helper used by both initial `put` and republish. 
+       * Each goroutine:
 
-**Result:** New nodes **eventually** discover old data without manual re-`put`; often immediately via path caching. 
+         * Builds a `FIND_VALUE` envelope, registers `inflight[msgID] = ch`, `send()`, `await ch or timeout`.
+         * Returns either **`{value, from}`** or **`{contacts}`**.
+     * **Collect results**:
 
-### Routing buckets didn’t evict stale nodes
+       * If **any** returns a value:
+         a) **`storeLocal(keyHex, val)`** (cache at requester),
+         b) **Path-cache**: choose the best contact you queried (close to the key, not the responder/self) and **`sendStoreTo`** it,
+         c) return the value + responder.
+       * If none returned a value: **merge** all returned contacts into your candidate pool (dedupe, mark visited), **recompute** the next batch of α **closest unvisited** and repeat.
+     * **Stop condition**: either value found, or you’ve converged (best distance didn’t improve) / no new contacts → give up (`NOTFOUND`).
 
-**Root cause:** no Kademlia LRU ping/evict policy; full buckets silently dropped newcomers, letting dead entries linger.
-**Fixes:** Full Kademlia behavior: ping **LRU**; if dead, **evict** and insert newcomer; if alive, **keep** LRU and cache newcomer in a **replacement cache**. Pings happen **outside** the routing table lock. Tests verify both dead-LRU and alive-LRU cases. 
+### What **FIND_VALUE** looks like on the wire
 
-## 2) Concurrency & thread-safety (M7)
+* **Sender path (`sendFindValueTo`)**
 
-**Concurrency mechanisms used:**
+  * Envelope: **`{Type: FIND_VALUE, From, MsgID, KeyHex}`**.
+  * Register waiter in `inflight`.
+  * `send`, await **`FIND_VALUE_OK`** or timeout.
+* **Receiver path (`handleFindValue`)**
 
-* **Goroutines** for UDP read-loop and per-peer RPCs (α-parallel fan-out during lookups).
-* **Channels** to correlate request/response via inflight map keyed by MsgID.
-* **Mutex/RWMutex** to guard shared structures (routing table, inflight map, value store).
-* **Timeouts** on all waits to prevent leaks and livelocks.
-* **Background republisher** goroutine—ticker-driven, never performs network I/O while holding data locks. 
+  * If **have the value** locally: reply with **`FIND_VALUE_OK{ Value: <bytes> }`**.
+  * Else: reply with **`FIND_VALUE_OK{ Contacts: <closest-to-key> }`**.
+  * In both cases, `routingTable.AddContact(From)` to keep knowledge fresh.
 
-**Thread-safety invariants:**
+> **Result:** the query “walks” the ID space, always toward nodes **closer to the key**. The first node that has the value stops the search. The requester caches it locally and (with **path caching**) plants it on a good nearby node so the *next* search is cheaper. Meanwhile, the **republisher** ensures long-term that the K **currently** closest nodes hold the value.
 
-* Every mutable map/list is behind a lock; **no network I/O while holding high-level locks** (evictions ping outside the lock; republisher releases locks before RPCs).
-* Read-loop never blocks: waiter channels are size-1; select with default avoids deadlocks if caller timed out.
-* Store loads/stores copy byte slices to avoid cross-goroutine aliasing.
-* Single socket reader (the read-loop) simplifies synchronization. 
+## 4) The “envelope” (your packet on the wire)
 
-Predictable throughput/latency, low deadlock risk, correctness under churn (routing updates safe; eviction probes liveness safely; republishing respects locks). Validation: run with `-race`; hammer lookups while starting/stopping peers—read-loop should never stall. 
+Every RPC uses the same wrapper:
 
-## 3) Debugging with Delve (Windows-proof, copy/paste)
+* **`wire.go : type envelope`**
+
+  * `Type` (one of: `PING`, `PONG`, `FIND_NODE`, `FIND_NODE_OK`, `FIND_VALUE`, `FIND_VALUE_OK`, `STORE`, `STORE_OK`)
+  * `From` (contact: `ID` + `Address`)
+  * `MsgID` (random per request; used to correlate responses)
+  * Optional fields depending on `Type`:
+
+    * `TargetID` (for `FIND_NODE`)
+    * `KeyHex`, `Value` (for `STORE` / `FIND_VALUE`)
+    * `Contacts` (for `FIND_NODE_OK` / `FIND_VALUE_OK` when returning peer lists)
+* **`marshal` / `unmarshal`** turn it into bytes and back.
+
+**Delivery:**
+
+* **`network.go : send()`** → `conn.WriteToUDP(b, to)`
+* **`network.go : readLoop()`** → `conn.ReadFromUDP(buf)` → `unmarshal` → deliver to waiter or handler.
+
+**Correlation:**
+
+* Sender registers a waiter channel in **`inflight`** keyed by `MsgID`, waits with a timeout.
+* **readLoop** finds **`inflight[msgID]`** and pushes the response envelope into it (non-blocking send).
+
+## 5) Routing table dynamics (what changes during all this)
+
+* **`routingtable.go : AddContact`**
+
+  * Any time a message arrives from `X` or you get a list including `X`, you add/refresh `X`.
+  * **Not full** → push front (MRU).
+  * **Full** → fetch **LRU** at the back, **release the lock**, `PingWait(LRU)`:
+
+    * **No PONG**: relock, remove LRU, insert newcomer (MRU).
+    * **PONG**: relock, move LRU to MRU (since we just saw it), **replacement cache** gets the newcomer.
+* **`bucket.go`**
+
+  * The list that keeps LRU order + a tiny **replacement cache** for overflow contacts.
+
+**Why this matters:** lookups depend on having **fresh, live contacts** in the right parts of the ID space. You don’t throw out reliable nodes for random new ones; you **do** replace dead ones.
+
+## 6) Background republisher (keeps placement correct over time)
+
+* **`kademlia.go : republisher()`** (goroutine, ticker)
+
+  * Snapshot **origin keys** you’ve put.
+  * For each: read value (under `storeMu`), **release locks**, then call **`replicateToClosest`** again.
+  * That re-runs the “find current K closest & STORE” loop.
+  * Newly joined closer nodes will **eventually** receive the value even if it was published long ago.
+
+## 7) Failure modes & protections (you’ll see these in traces)
+
+* **Timeouts everywhere**: any RPC can drop; your code moves on (α-way parallelism helps).
+* **Non-blocking response delivery**: `readLoop` won’t stall if a waiter already timed out (waiter channels are size-1, send is guarded).
+* **No network under locks**: eviction pings and replication happen after releasing table/store locks. Prevents deadlocks with the `readLoop`.
+* **Copies on store/load**: value bytes are copied on write and on read → no sharing the same slice across goroutines.
+
+## TL;DR journey
+
+1. **Start** → socket bound; `readLoop` listening; routing table ready; (optional) ping/bootstrap warm-up.
+2. **put** → hash → local store → find current K-closest → `STORE` to each → replicas acknowledge.
+3. **get** → local check → iterative α-parallel `FIND_VALUE` walk toward the key:
+
+   * Either a node returns the **value** → requester caches + **path-caches** on a close node → done.
+   * Or nobody has it → returns `NOTFOUND`.
+4. **In the background** the **republisher** periodically re-sends to the *current* closest so data migrates as the network changes.
+5. **All along**, the routing table keeps itself sane: LRU eviction with liveness pings, replacement cache for newcomers.
+
+## Debugging with Delve (Windows-proof, copy/paste)
 
 Delve steps for M1/M2 with reliable Windows command forms, including building an unoptimized test binary and a minimal dlv command set. Includes pre-made breakpoint/trace scripts and “tour” flows (M2 happy path, concurrent GETs, M1 Ping/Lookup). 
 
@@ -90,7 +246,163 @@ config max-string-len 256
 c
 ```
 
-## 4) Unit testing & coverage (M4)
+# What we do (concurrency primitives in use)
+
+1. **Goroutines for network I/O + per-RPC fan-out**
+
+* A dedicated **UDP read loop** runs in its own goroutine and never blocks the caller. It demultiplexes responses to the right waiter and dispatches requests to handlers. 
+* Lookups (`LookupContact` / `Get`) **fan out** to multiple peers **in parallel**: each peer RPC runs in a separate goroutine, results are joined through channels. This is your α-parallelism. 
+
+2. **Channels for request/response correlation**
+
+* For every outbound RPC, the sender allocates a **response channel** (buffer 1), registers it in `inflight[msgID]`, and waits on it or times out. The **read loop** pushes the matching envelope into that channel. 
+
+3. **Mutexes / RWMutexes for shared state**
+
+* `network.mu` protects the **inflight map** and request registration/removal. 
+* `routingTable.mu` is an **RWMutex** guarding buckets (reads during closest-contact queries, writes on insert/move/evict). Buckets themselves are mutated **only while the table lock is held**. 
+* `storeMu` (RWMutex) protects the **value store** map; reads/writes copy byte slices to avoid aliasing across goroutines. 
+
+4. **Timers/timeouts for liveness and to avoid leaks**
+
+* All blocking waits on RPC responses have `time.After` timeouts. If nothing arrives, we clean up the waiter and move on—no goroutine leaks, no permanent stalls. 
+
+5. **Background maintenance goroutines (republisher)**
+
+* A **ticker-driven republisher** runs in its own goroutine, periodically re-replicating origin values to the current K-closest nodes. Clean shutdown via a stop channel. 
+
+---
+
+# Where we do it (by subsystem)
+
+## Networking (`network.go`)
+
+* **`readLoop()`**: runs as a goroutine; reads UDP; `unmarshal`s;
+
+  * If it’s a **response** (PONG / FIND_NODE_OK / FIND_VALUE_OK / STORE_OK), it **signals the waiting goroutine** via `inflight[msgID] <- env` (non-blocking send to a size-1 channel so the loop never deadlocks).
+  * If it’s a **request** (PING / FIND_NODE / FIND_VALUE / STORE), it calls the appropriate handler which may update routing and/or store. 
+
+* **inflight map**:
+
+  * On send: create `ch := make(chan envelope, 1)`, `inflight[msgID] = ch` under `network.mu`.
+  * On completion: remove the entry in a `defer` to guarantee cleanup on all paths.
+  * On receive: readLoop looks up `inflight[msgID]` under `network.mu` and signals it.
+    This is the core request/response correlation point. 
+
+* **Client helpers** (all run concurrently per peer):
+
+  * `SendFindContactMessageTo` (for FIND_NODE) and `sendFindValueTo` (for FIND_VALUE) create a waiter, send the request, then `select { case resp := <-ch ...; case <-time.After(...) ... }`. This makes **each RPC fully concurrent** and failure-isolated. 
+
+* **Close()**: closes the socket and waits for `readStopped` to trip, preventing races between shutdown and the read loop. 
+
+**Why:**
+
+* Single read loop = one place to touch the socket; channels + inflight map give lock-free handoff to the waiting goroutine; buffered channels + default send prevent the loop from stalling if a waiter misbehaves. Timeouts keep the system live under packet loss.
+
+## Lookup engine (`kademlia.go`)
+
+* **`LookupContact`** (iterative FIND_NODE) and **`Get`** (iterative FIND_VALUE) implement α-parallel querying:
+
+  * Build the next **batch** of up to α **unvisited** closest contacts.
+  * For each peer in the batch, **spawn a goroutine** issuing the RPC; push each result into a batch-scoped channel.
+  * After collecting all batch results, merge contacts into the routing table (via network handlers) and check the **convergence criterion** (best distance stopped improving). Repeat until convergence or value found. 
+
+* **Local value store** uses `storeMu` (RWMutex).
+
+  * `storeLocal` acquires a **write** lock, lazily initializes the map, and **copies** the bytes before storing.
+  * `loadLocal` acquires a **read** lock and returns a **copy** of the stored bytes. This prevents concurrent mutation bugs by callers. 
+
+* **Republisher goroutine**:
+
+  * Started after `NewNetwork`.
+  * `ticker := time.NewTicker(republishInterval)`; on each tick, snapshot `originKeys` under `originMu`, read values under `storeMu`, then call `replicateToClosest` (networking) **outside** those locks.
+  * Clean exit when the stop channel is closed in `Close()`. 
+
+**Why:**
+
+* α-parallelism gives you the performance Kademlia expects.
+* Copy-on-store and copy-on-read make the store safe even if callers (CLI/tests) hold onto slices across goroutines.
+* Republisher runs concurrently but never holds data locks while doing network I/O—this avoids lock-hold cycles.
+
+## Routing (`routingtable.go`, `bucket.go`)
+
+* **Routing table** has an **RWMutex**; all bucket mutations happen under **write** lock, and lookups (`FindClosestContacts`) under **read** lock. Buckets are simple `container/list` LRU lists; we never touch them without holding the table lock. 
+
+* **LRU eviction policy with liveness ping** (your new behavior):
+
+  * If the bucket is **full**: capture the LRU contact, **release the lock**, do a `PingWait(lru)` (network call) **outside** the lock, then re-lock and either **evict** or **keep** the LRU; insert or replacement-cache the newcomer accordingly.
+  * This design strictly avoids doing network I/O while holding `routingTable.mu`. 
+
+**Why:**
+
+* The table is shared by: the **read loop** (handlers) and the **application goroutines** (lookups/puts). The RWMutex ensures those meet safely.
+* Pinging outside the lock prevents deadlocks (e.g., the read loop needs the lock to add contacts when the PONG arrives; holding it would deadlock).
+
+## CLI (`cli.go`)
+
+* The CLI runs a simple scanner loop (single goroutine). All concurrency is in the node/network layers it calls into. That’s intentional—keeps the front-end dead simple. 
+
+## How we guarantee thread safety (concrete invariants)
+
+1. **Every shared map/list is behind a lock**
+
+* `network.inflight` → `network.mu`; `routingTable.buckets`/`bucket.list` → `routingTable.mu`; `valueStore` → `storeMu`. No unlocked writes, period. 
+
+2. **No network I/O while holding high-level locks**
+
+* The routing table’s eviction path *releases* the lock before pinging LRU; republisher reads keys/values under locks, then **releases locks before** doing `STORE` RPCs. This prevents lock ordering inversions with the read loop (which itself grabs the table lock in handlers). 
+
+3. **Response routing never blocks the read loop**
+
+* Waiter channels are **size 1**; the read loop uses a **non-blocking send** (select with `default`) to deliver the response and then continue. Even if a caller already timed out (and no one’s listening), the loop won’t get stuck. 
+
+4. **Timeouts everywhere a goroutine could otherwise wait forever**
+
+* All RPC waits use `select { case resp := <-ch ...; case <-time.After(...) }` with `defer` to remove inflight entries, guaranteeing cleanup and preventing leaks. 
+
+5. **Byte-slice copies** in the store
+
+* We never hand out references to internal storage; both store and load copy. That prevents cross-goroutine mutation of shared buffers. 
+
+6. **Single socket reader**
+
+* Only the read loop reads from the UDP socket, removing the need for additional synchronization on the network read path. Send path uses the kernel for serialization; our own `send()` is stateless apart from marshaling. 
+
+## Why this design (trade-offs & failure modes we avoid)
+
+* **Throughput & latency:** α-parallelism + per-peer goroutines give you the expected sub-linear lookup latency while preserving correctness. If a subset of peers are slow or unresponsive, timeouts isolate them without stalling the whole lookup. 
+
+* **Simplicity where it counts:** one read loop, small critical sections with clear ownership. Locks wrap only data structures, never the network. That makes deadlocks unlikely and debuggable if they ever appear. 
+
+* **Correctness under churn:**
+
+  * Routing updates from *any* message handler are safe (handlers run on the read-loop goroutine, but the table is protected by RWMutex).
+  * Evictions probe liveness without risking lock deadlocks.
+  * Republishing runs concurrently but respects data-structure locks and never blocks readers for long. 
+
+* **Defensive coding:** non-blocking delivery to waiters + timeouts mean an application bug on the caller side can’t wedge the network loop. 
+
+## If you want to validate this (quick checklist)
+
+* Run with the race detector:
+  `go test ./labs/kademlia -race` and `go run -race ./labs/kademlia/cmd/cli ...`
+  You should see **no race reports** under normal put/get, bootstrapping, and eviction tests.
+
+* Turn on your debug prints (NET/GET/REPLICATE) and hammer lookups while starting/stopping peers; the node should keep making progress, and the read loop should never stall.
+
+---
+
+## File anchors
+
+* **Networking:** read loop, inflight map, RPC helpers, timeouts, Close. 
+* **Lookups & Store:** α-parallel fan-out, convergence, thread-safe value store, republisher goroutine. 
+* **Routing:** RWMutex on table, LRU buckets, eviction/ping outside lock, closest-contacts query under RLock. 
+* **CLI:** single-threaded front-end. 
+* **Wire types / message kinds:** shared envelope format used across goroutines. 
+
+That’s the concurrency story: **concurrent message handling** with **goroutines + channels**, and **thread safety** via **scoped locks**, **timeouts**, and **no network under locks**.
+
+## Unit testing & coverage (M4)
 
 **Run everything from the package directory**: `…\d7024e\labs\kademlia`. Guidance includes reliable PowerShell commands for coverage, HTML reports, and race detector on Windows (with MSYS2 GCC). Also has filtered runs for only M1/M2/M3 tests. 
 
@@ -110,7 +422,7 @@ go tool cover -func "$path"
 go tool cover -html "$path" -o "C:\Users\adisis\Downloads\D7024E\d7024e\labs\kademlia\coverage.html"
 ```
 
-## 5) Large-scale emulation (M4: 1000–2000 nodes + packet drop)
+## Large-scale emulation (M4: 1000–2000 nodes + packet drop)
 
 A **test-only simulator** drives 1000+ nodes and applies a configurable **drop %** to deliveries—no runtime code changes. Flags: `-m4.nodes`, `-m4.drop`, `-m4.seed`. Commands for both PS and bash are provided; defaults are 1000 nodes/10% drop. 
 
@@ -127,7 +439,7 @@ go test . -count=1 -timeout=300s -run '^TestM4_Simulation_' "-m4.nodes=2000" "-m
 
 Why a simulator? Because 1000+ UDP sockets on localhost is brittle; simulator is fast/deterministic and keeps production code untouched. We still exercise **K-closest replication** and **FIND_VALUE** under drop. 
 
-Short answer: you already have packet drop in the **M4 simulator**. It’s implemented in the test harness (not in the real UDP stack), and it’s applied in three places:
+We have packet drop in the **M4 simulator**. It’s implemented in the test harness (not in the real UDP stack), and it’s applied in three places:
 
 * during **STORE** replication (put path),
 * on **FIND_VALUE** request delivery (get path),
@@ -194,7 +506,7 @@ go test . -count=1 -timeout=60s -run '^TestM4_Simulation_InvalidKey_NotFound$'
 
 * We have packet drop in the M4 simulation, and it’s applied on both **replication** and **lookup** codepaths with a deterministic PRNG and a user-settable `-m4.drop` percent. See `dropped()`, its use in `simPut` and `simGet`, and the M4 tests.  
 
-## 6) Containerization (M5): run 50+ containers on one machine
+## Containerization (M5): run 50+ containers on one machine
 
 Compose spins one **seed** plus **N knodes** on a private bridge network. Entrypoint computes the **container IP** and announces it (`-addr <ip:9000>`). The image builds in **GOPATH mode** and mirrors `labs/kademlia` to `/go/src/d7024e/kademlia`, matching imports like `d7024e/kademlia`. **You can scale to ≥50** with one flag. 
 
@@ -244,7 +556,7 @@ docker compose down -v     # also remove anonymous volumes
 
 ---
 
-## 7) Demos (end-to-end)
+## Demos (end-to-end)
 
 **Local (two terminals):**
 
