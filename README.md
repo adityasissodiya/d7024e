@@ -246,7 +246,7 @@ config max-string-len 256
 c
 ```
 
-# What we do (concurrency primitives in use)
+## What we do (concurrency primitives in use)
 
 1. **Goroutines for network I/O + per-RPC fan-out**
 
@@ -273,7 +273,7 @@ c
 
 ---
 
-# Where we do it (by subsystem)
+## Where we do it (by subsystem)
 
 ## Networking (`network.go`)
 
