@@ -1,31 +1,31 @@
+version: "3.9"
+
 services:
   seed:
     build:
-      context: ..              # repo root (has labs/)
+      context: ..                 # repo root
       dockerfile: labs/Dockerfile
-    image: d7024e-node:latest
-    command: ["seed"]         # passed to entrypoint.sh
+    container_name: kad-seed
+    command: ["seed"]            # <-- only the role, ENTRYPOINT already runs the script
     environment:
       PORT: "9000"
     networks: [kadnet]
-    expose: ["9000/udp"]
-    stdin_open: true
-    tty: true
+    stdin_open: true             # needed for docker attach
+    tty: true                    # needed for docker attach
     restart: unless-stopped
 
   knode:
     build:
       context: ..
-    # uses the same labs/Dockerfile by default since it's in the context root? No—be explicit:
       dockerfile: labs/Dockerfile
-    image: d7024e-node:latest
-    command: ["node"]
+    command: ["node"]            # <-- only the role
     depends_on: [seed]
     environment:
       PORT: "9000"
       BOOTSTRAP_HOST: "seed"
     networks: [kadnet]
-    expose: ["9000/udp"]
+    stdin_open: true  # needed for docker attach
+    tty: true # needed for docker attach
     restart: unless-stopped
 
 networks:
